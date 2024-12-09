@@ -17,6 +17,100 @@ class AWait:
         return result
 
 
+class PriorityQueue:
+    def __init__(self):
+        self.__queue = []
+
+    def __iadd__(self, item):
+        if item.heap_index is not None:
+            raise ValueError("The item is already add to a priority queue")
+
+        i = len(self.__queue)
+        self.__queue.append(item)
+        if self.__up(i):
+            return self
+        item.heap_index = i
+        return self
+
+    def __delitem__(self, item):
+        i = item.heap_index
+        if i is None:
+            raise ValueError("The item is not belong to the priority queue")
+
+        item.heap_index = None
+        item = self.__queue[-1]
+        self.__queue.pop()
+        if i >= len(self.__queue):
+            return
+        self.__queue[i] = item
+        if self.__up(i):
+            return
+        if self.__down(i):
+            return
+        item.heap_index = i
+
+    def popitem(self):
+        if not self.__queue:
+            return None
+        item = self.__queue[0]
+        self.remove(item)
+        return item
+
+    def __len__(self):
+        return len(self.__queue)
+
+    def __bool__(self):
+        return len(self.__queue) > 0
+
+    def __getitem__(self, index):
+        return self.__queue[index]
+
+    def __up(self, position):
+        index = position
+        new_item = self.__queue[index]
+        while index > 0:
+            i = (index - 1) >> 1
+            item = self.__queue[i]
+            if new_item > item:
+                break
+
+            item.heap_index = index
+            self.__queue[index] = item
+            index = i
+
+        if index == position:
+            return False
+        self.__queue[index] = new_item
+        new_item.heap_index = index
+        return True
+
+    def __down(self, position):
+        index = position
+        new_item = self.__queue[index]
+        while True:
+            i = (index << 1) + 1
+            if i >= len(self.__queue):
+                break
+
+            if (i + 1) < len(self.__queue):
+                if self.__queue[i + 1] < self.__queue[i]:
+                    i = i + 1
+
+            item = self.__queue[i]
+            if not item < new_item:
+                break
+
+            item.heap_index = index
+            self.__queue[index] = item
+            index = i
+
+        if index == position:
+            return False
+        self.__queue[index] = new_item
+        new_item.heap_index = index
+        return True
+
+
 class Timer:
     def __init__(self, task, seconds):
         self.__expire = time.monotonic() + seconds
@@ -40,37 +134,37 @@ class Timer:
 class EventLoop:
     def __init__(self):
         self.__selector = selectors.DefaultSelector()
-        self.__tasks = []
-        self.__timers = []
+        self.__task_list = []
+        self.__timer_queue = PriorityQueue()
         self.__num_fds = 0
         self.__num_coroutines = 0
         self.__current = None
 
     def __run_tasks(self):
-        if not self.__tasks:
+        if not self.__task_list:
             return
-        tasks = self.__tasks
-        self.__tasks = []
-        for task in tasks:
+        task_list = self.__task_list
+        self.__task_list = []
+        for task in task_list:
             self.__exec(task)
 
     def __run_expired(self):
-        if not self.__timers:
+        if not self.__timer_queue:
             return
         now = time.monotonic()
-        while self.__timers:
-            if self.__timers[0].expire > now:
+        while self.__timer_queue:
+            if self.__timer_queue[0].expire > now:
                 break
-            timer = heapq.heappop(self.__timers)
+            timer = self.__timer_queue.popitem()
             if timer.task is not None:
                 self.__exec(timer.task)
 
     def __select_events(self):
         seconds = None
-        if self.__tasks:
+        if self.__task_list:
             seconds = 0
-        elif self.__timers:
-            seconds = self.__timers[0].expire - time.monotonic()
+        elif self.__timer_queue:
+            seconds = self.__timer_queue[0].expire - time.monotonic()
 
         if self.__num_fds > 0:
             for key, events in self.__selector.select(seconds):
