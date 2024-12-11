@@ -8,7 +8,7 @@ import threading
 import traceback
 
 
-class AWait:
+class Await:
     def __init__(self, trap):
         self.__trap = trap
 
@@ -21,40 +21,42 @@ class PriorityQueue:
     def __init__(self):
         self.__queue = []
 
-    def __iadd__(self, item):
-        if item.heap_index is not None:
+    def add(self, item):
+        if getattr(item, "heap_index", None) is not None:
             raise ValueError("The item is already add to a priority queue")
 
         i = len(self.__queue)
         self.__queue.append(item)
-        if self.__up(i):
-            return self
-        item.heap_index = i
-        return self
+        self.__up(i)
 
-    def __delitem__(self, item):
-        i = item.heap_index
-        if i is None:
-            raise ValueError("The item is not belong to the priority queue")
+    def remove(self, item):
+        i = getattr(item, "heap_index", None)
+        if i is None or i < 0 or i >= len(self.__queue):
+            return False
 
         item.heap_index = None
-        item = self.__queue[-1]
-        self.__queue.pop()
-        if i >= len(self.__queue):
-            return
-        self.__queue[i] = item
-        if self.__up(i):
-            return
-        if self.__down(i):
-            return
-        item.heap_index = i
+        item = self.__queue.pop()
+        if i < len(self.__queue):
+            self.__queue[i] = item
+            self.__up(i)
+            if item.heap_index == i:
+                self.__down(i)
+
+        return True
 
     def popitem(self):
         if not self.__queue:
             return None
-        item = self.__queue[0]
-        self.remove(item)
-        return item
+
+        result = self.__queue[0]
+        result.heap_index = None
+
+        item = self.__queue.pop()
+        if self.__queue:
+            self.__queue[0] = item
+            self.__down(0)
+
+        return result
 
     def __len__(self):
         return len(self.__queue)
@@ -65,62 +67,60 @@ class PriorityQueue:
     def __getitem__(self, index):
         return self.__queue[index]
 
-    def __up(self, position):
-        index = position
-        new_item = self.__queue[index]
-        while index > 0:
-            i = (index - 1) >> 1
-            item = self.__queue[i]
-            if new_item > item:
+    def __up(self, index):
+        i = index
+        item = self.__queue[i]
+        while i > 0:
+            n = (i - 1) >> 1
+            next_item = self.__queue[n]
+            if not item < next_item:
                 break
 
-            item.heap_index = index
-            self.__queue[index] = item
-            index = i
+            self.__queue[i] = next_item
+            next_item.heap_index = i
+            i = n
 
-        if index == position:
-            return False
-        self.__queue[index] = new_item
-        new_item.heap_index = index
-        return True
+        self.__queue[i] = item
+        item.heap_index = i
 
-    def __down(self, position):
-        index = position
-        new_item = self.__queue[index]
+    def __down(self, index):
+        i = index
+        item = self.__queue[i]
         while True:
-            i = (index << 1) + 1
-            if i >= len(self.__queue):
+            n = (i << 1) + 1
+            if n >= len(self.__queue):
                 break
 
-            if (i + 1) < len(self.__queue):
-                if self.__queue[i + 1] < self.__queue[i]:
-                    i = i + 1
+            if (n + 1) < len(self.__queue):
+                if self.__queue[n + 1] < self.__queue[n]:
+                    n = n + 1
 
-            item = self.__queue[i]
-            if not item < new_item:
+            next_item = self.__queue[n]
+            if not next_item < item:
                 break
 
-            item.heap_index = index
-            self.__queue[index] = item
-            index = i
+            next_item.heap_index = i
+            self.__queue[i] = next_item
+            i = n
 
-        if index == position:
-            return False
-        self.__queue[index] = new_item
-        new_item.heap_index = index
-        return True
+        self.__queue[i] = item
+        item.heap_index = i
+
+
+class SuspendException(Exception):
+    pass
 
 
 class Timer:
     def __init__(self, task, seconds):
-        self.__expire = time.monotonic() + seconds
         self.__task = task
+        self.__expire = time.monotonic() + seconds
 
     def __lt__(self, rhs):
         return self.expire < rhs.expire
 
     def cancel(self):
-        self.__task = None
+        get_event_loop().cancel_timer(self)
 
     @property
     def expire(self):
@@ -156,8 +156,7 @@ class EventLoop:
             if self.__timer_queue[0].expire > now:
                 break
             timer = self.__timer_queue.popitem()
-            if timer.task is not None:
-                self.__exec(timer.task)
+            self.__exec(timer.task)
 
     def __select_events(self):
         seconds = None
@@ -174,15 +173,20 @@ class EventLoop:
             sleep(seconds if seconds is not None else 1)
 
     def __exec(self, task):
-        try:
-            ctxt = task()
-        except:
-            print("exec {}".format(sys.exc_info()))
-            raise
+        if isinstance(task, types.CoroutineType):
+            ctxt = task
         else:
-            if isinstance(ctxt, types.CoroutineType):
-                self.__num_coroutines += 1
-                self.resume(ctxt)
+            try:
+                ctxt = task()
+            except:
+                print("exec {}".format(sys.exc_info()))
+                return
+
+            if not isinstance(ctxt, types.CoroutineType):
+                return
+
+        self.__num_coroutines += 1
+        self.resume(ctxt)
 
     def resume(self, ctxt, result=None):
         self.__current = ctxt
@@ -197,10 +201,10 @@ class EventLoop:
 
             try:
                 result = trap(ctxt)
-            except BlockingIOError:
+            except SuspendException:
                 break
-            except Exception as exception:
-                result = exception
+            except Exception as e:
+                result = e
 
         self.__current = None
 
@@ -216,26 +220,29 @@ class EventLoop:
         self.__selector.modify(fd, events, data)
 
     def post(self, task):
-        self.__tasks.append(task)
+        self.__task_list.append(task)
 
-    def expires_after(self, seconds, task):
+    def expires_after(self, task, seconds):
         timer = Timer(task, seconds)
-        heapq.heappush(self.__timers, timer)
+        self.__timer_queue.add(timer)
         return timer
+
+    def cancel_timer(self, timer):
+        self.__timer_queue.remove(timer)
 
     def sleep(self, seconds):
         def __await(ctxt):
-            self.expires_after(seconds, lambda: self.resume(ctxt))
-            raise BlockingIOError()
+            self.expires_after(lambda: self.resume(ctxt), seconds)
+            raise SuspendException()
 
-        return AWait(__await)
+        return Await(__await)
 
     def sched_yield(self):
         def __await(ctxt):
             self.post(lambda: self.resume(ctxt))
-            raise BlockingIOError()
+            raise SuspendException()
 
-        return AWait(__await)
+        return Await(__await)
 
     def current(self):
         return self.__current
@@ -247,7 +254,7 @@ class EventLoop:
             self.__run_expired()
 
     def run_until_complete(self):
-        while self.__num_fds > 0 or self.__num_coroutines or self.__tasks or self.__timers:
+        while self.__num_fds > 0 or self.__num_coroutines or self.__task_list or self.__timer_queue:
             self.__run_tasks()
             self.__select_events()
             self.__run_expired()
@@ -257,9 +264,8 @@ thread = threading.local()
 
 
 def get_event_loop():
-    try:
-        event_loop = thread.event_loop
-    except AttributeError:
+    event_loop = getattr(thread, "event_loop", None)
+    if event_loop is None:
         event_loop = EventLoop()
         thread.event_loop = event_loop
     return event_loop
@@ -269,8 +275,8 @@ def post(task):
     get_event_loop().post(task)
 
 
-def expires_after(seconds, task):
-    return get_event_loop().expires_after(seconds, task)
+def expires_after(task, seconds):
+    return get_event_loop().expires_after(task, seconds)
 
 
 def sleep(seconds):
@@ -333,9 +339,9 @@ class Socket:
                     resume(ctxt, None if err == 0 else OSError(err, os.strerror(err)))
 
                 self.__register(selectors.EVENT_WRITE, __wakeup)
-                raise
+                raise SuspendException()
 
-        return AWait(__await)
+        return Await(__await)
 
     def accept(self):
         def __await(ctxt):
@@ -352,11 +358,11 @@ class Socket:
                         resume(ctxt, Socket(fd))
 
                 self.__register(selectors.EVENT_READ, __wakeup)
-                raise
+                raise SuspendException()
             else:
                 return Socket(fd)
 
-        return AWait(__await)
+        return Await(__await)
 
     def send(self, buf, flags=0):
         def __await(ctxt):
@@ -373,11 +379,11 @@ class Socket:
                         resume(ctxt, size)
 
                 self.__register(selectors.EVENT_WRITE, __wakeup)
-                raise
+                raise SuspendException()
             else:
                 return size
 
-        return AWait(__await)
+        return Await(__await)
 
     def recv(self, bufsize, flags=0):
         def __await(ctxt):
@@ -394,9 +400,9 @@ class Socket:
                         resume(ctxt, buf)
 
                 self.__register(selectors.EVENT_READ, __wakeup)
-                raise
+                raise SuspendException()
 
-        return AWait(__await)
+        return Await(__await)
 
     def async_connect(self, callback, address):
         try:
@@ -573,9 +579,9 @@ class Mutex:
                     post(lambda: resume(ctxt))
 
                 self.__wait_queue.append(__wakeup)
-                raise BlockingIOError()
+                raise SuspendException()
 
-        return AWait(__await)
+        return Await(__await)
 
     def unlock(self):
         if self.__owner != current():
@@ -621,9 +627,9 @@ class ConditionVariable:
                 mutex._Mutex__async_unlock(ctxt)
                 self.__wait_queue.append(lambda: mutex._Mutex__async_lock(ctxt, lambda: post(lambda: resume(ctxt))))
 
-            raise BlockingIOError()
+            raise SuspendException()
 
-        return AWait(__await)
+        return Await(__await)
 
     def timed_wait(self, seconds, mutex=None):
         def __await(ctxt):
@@ -649,11 +655,11 @@ class ConditionVariable:
             if mutex is not None:
                 mutex._Mutex__async_unlock(ctxt)
 
-            timer = expires_after(seconds, __timeout)
+            timer = expires_after(__timeout, seconds)
             self.__wait_queue.append(__wakeup)
-            raise BlockingIOError()
+            raise SuspendException()
 
-        return AWait(__await)
+        return Await(__await)
 
     def signal(self):
         if self.__wait_queue:
